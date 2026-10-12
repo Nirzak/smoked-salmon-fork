@@ -1,4 +1,4 @@
-"""`salmon cross-upload`: upload a torrent that is on RED, OPS or DIC to another of them, from the files on disk.
+"""`salmon cross-upload`: upload a torrent that is on RED, OPS, DIC or DG to another of them, from the files on disk.
 
 The run reads every release's torrent from SOURCE and checks it locally first (the data the form gets, TARGET's
 Do-Not-Upload list, the files on disk, the log, the images), shows the plan, and only then sends anything to TARGET:
@@ -79,7 +79,7 @@ from salmon.uploader.upload import (
 )
 
 # The trackers a release can go between.
-TRACKERS = ("RED", "OPS", "DIC")
+TRACKERS = ("RED", "OPS", "DIC", "DG")
 MAX_RELEASES = 5
 # The MP3 transcodes --transcode offers.
 TRANSCODES = ("320", "V0")
@@ -104,12 +104,14 @@ TRACKER_HOSTS = {
     "OPS": ("orpheus.network", "opsfet.ch"),
     # DIC's site, and the domain its announces are on (tracker.52dic.vip).
     "DIC": ("dicmusic.com", "52dic.vip"),
+    # DG's site and tracker announce domain.
+    "DG": ("desigaane.rocks",),
 }
 # The HOST_RULES row of a tracker's own image host, which says where its images show. A tracker with none shows
 # only its own images.
 TRACKER_IMAGE_HOSTS = {"RED": "red"}
 # The media a tracker names otherwise than SOURCES does: OPS's BD is RED's and DIC's Blu-Ray.
-TRACKER_MEDIA = {"OPS": {"Blu-Ray": "BD"}, "RED": {"BD": "Blu-Ray"}, "DIC": {"BD": "Blu-Ray"}}
+TRACKER_MEDIA = {"OPS": {"Blu-Ray": "BD"}, "RED": {"BD": "Blu-Ray"}, "DIC": {"BD": "Blu-Ray"}, "DG": {"Blu-Ray": "BD"}}
 # The trackers whose API gives descriptions HTML-escaped. DIC is assumed to be like RED: no sample of its answers
 # shows it either way.
 ESCAPED_DESCRIPTIONS = ("RED", "DIC")
@@ -1101,7 +1103,7 @@ async def _lossy_approval(release: Release, source: "BaseGazelleApi") -> bool | 
     keys = ("lossyMasterApproved", "lossyWebApproved")
     if any(key in torrent for key in keys):
         return any(torrent.get(key) for key in keys)
-    if source.site_code != "OPS" or not source.has_session_cookie:
+    if source.site_code not in ("OPS", "DG") or not source.has_session_cookie:
         return None
     # OPS's API does not say: its group page does, as a label on the torrent's row. The page holds the
     # user's passkey and authkey: it is only parsed, never printed or kept.
