@@ -4,12 +4,17 @@ from urllib import parse
 import asyncclick as click
 
 from salmon import cfg, interaction
-from salmon.trackers import dic, ops, red
+from salmon.trackers import dg, dic, ops, red
 from salmon.trackers.base import BaseGazelleApi
 
 # hard coded as it needs to reflect the imports anyway.
-tracker_classes = {"RED": red.RedApi, "OPS": ops.OpsApi, "DIC": dic.DICApi}
-tracker_url_code_map = {"redacted.sh": "RED", "orpheus.network": "OPS", "dicmusic.com": "DIC"}
+tracker_classes = {"RED": red.RedApi, "OPS": ops.OpsApi, "DIC": dic.DICApi, "DG": dg.DGApi}
+tracker_url_code_map = {
+    "redacted.sh": "RED",
+    "orpheus.network": "OPS",
+    "dicmusic.com": "DIC",
+    "desigaane.rocks": "DG",
+}
 
 # tracker_list is used to offer the user choices. Generated if not specified in the config.
 tracker_cfg = cfg.tracker
@@ -20,6 +25,8 @@ if tracker_cfg.ops:
     tracker_list.append("OPS")
 if tracker_cfg.dic:
     tracker_list.append("DIC")
+if tracker_cfg.dg:
+    tracker_list.append("DG")
 
 
 class UnknownTrackerError(ValueError):

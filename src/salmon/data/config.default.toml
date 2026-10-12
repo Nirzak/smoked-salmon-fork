@@ -144,6 +144,12 @@ session = 'get-from-site-cookie'
 # In case you want separate output folders for .torrent files
 # dottorrents_dir = 'path to dic dir'
 
+[tracker.dg]
+session = 'get-from-site-cookie'
+# api_key = 'dg-api-key'           # Needs uploading privileges (optional for now)
+# In case you want separate output folders for .torrent files
+# dottorrents_dir = 'path to dg dir'
+
 # ===============================
 # SEEDING SETTINGS
 # ===============================
@@ -337,7 +343,7 @@ session = 'get-from-site-cookie'
 
 # [proxy.services]
 # # One key per service, set as in the examples above. Unset, a service uses [proxy] url.
-# # Trackers: red, ops, dic
+# # Trackers: red, ops, dic, dg
 # # Metadata sources: qobuz, tidal, bandcamp, deezer, beatport, discogs, apple_music
 # # Image hosts: catbox, imgbb, oeimg, ptscreens, ra
 
