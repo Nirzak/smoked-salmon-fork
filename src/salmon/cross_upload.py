@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 import anyio
 import asyncclick as click
+import msgspec
 from bs4 import BeautifulSoup
 from torf import TorfError, Torrent, VerifyContentError
 
@@ -1340,17 +1341,22 @@ async def _rehost_images(
         if url not in images:
             if fetcher_code not in fetchers:
                 fetchers[fetcher_code] = salmon.trackers.get_class(fetcher_code)()
-            images[url] = await _fetch_image(url, fetchers[fetcher_code])
+            is_third_party = fetcher_code != source.site_code
+            images[url] = await _fetch_image(url, fetchers[fetcher_code], use_imgauth=is_third_party)
         key = (host, url)
         if key not in new_urls:
             new_urls[key] = await _upload_image(*images[url], _bare(url), target, host)
         data[field_name] = data[field_name].replace(url, new_urls[key])
 
 
-async def _fetch_image(url: str, fetcher: "BaseGazelleApi") -> tuple[bytes, str]:
+async def _fetch_image(
+    url: str, fetcher: "BaseGazelleApi", *, use_imgauth: bool = False
+) -> tuple[bytes, str]:
     """Fetch an image from a tracker's own site through that tracker's client: its content and its file suffix.
 
-    The fetcher's credentials only ever go to its own site.
+    The fetcher's credentials only ever go to its own site. When use_imgauth is True (fetching from a
+    third-party tracker's image host), the imgauth API endpoint is called first to obtain temporary download
+    credentials. Otherwise, the session cookie is used for same-origin fetches.
 
     Raises:
         CrossUploadRefused: If it is not on the fetcher's site, cannot be fetched, or is not an image.
@@ -1360,11 +1366,22 @@ async def _fetch_image(url: str, fetcher: "BaseGazelleApi") -> tuple[bytes, str]
         raise CrossUploadRefused(f"{shown} is not on {fetcher.site_string}'s own site")
     click.secho(f"Fetching {shown} from {fetcher.site_string}...", fg="yellow")
     try:
-        # Through the fetcher's client: its rate limit, retries and redirect rules, and its credentials only ever
-        # go to its own site.
-        response = await fetcher._request(
-            "GET", url, timeout_secs=30, prefer_api_key=not fetcher.has_session_cookie, needs_authkey=False, binary=True
-        )
+        if use_imgauth:
+            # Third-party tracker image: authenticate via the imgauth API to get temporary download credentials.
+            authed_url = await _imgauth_url(url, fetcher)
+            response = await fetcher._request(
+                "GET", authed_url, timeout_secs=30, prefer_api_key=False, needs_authkey=False, binary=True
+            )
+        else:
+            # Source's own image: fetch with the session cookie (same origin as the API).
+            response = await fetcher._request(
+                "GET",
+                url,
+                timeout_secs=30,
+                prefer_api_key=not fetcher.has_session_cookie,
+                needs_authkey=False,
+                binary=True,
+            )
     except RequestError as error:
         raise CrossUploadRefused(f"could not fetch {shown} ({type(error).__name__})") from None
     suffix = next((ext for magic, ext in _IMAGE_MAGIC.items() if response.content.startswith(magic)), None)
@@ -1373,6 +1390,39 @@ async def _fetch_image(url: str, fetcher: "BaseGazelleApi") -> tuple[bytes, str]
     if suffix is None:
         raise CrossUploadRefused(f"{shown} is not an image")
     return response.content, suffix
+
+
+async def _imgauth_url(url: str, fetcher: "BaseGazelleApi") -> str:
+    """Authenticate a tracker image URL via the imgauth API endpoint.
+
+    Calls ajax.php?action=imgauth with the API key to get temporary credentials (h, e, u), then appends
+    them as query parameters to the image URL.
+
+    Raises:
+        RequestFailedError: If the imgauth call fails.
+    """
+    resp = await fetcher._request(
+        "GET",
+        fetcher.base_url + "/ajax.php",
+        params={"action": "imgauth"},
+        timeout_secs=10,
+        prefer_api_key=True,
+    )
+    try:
+        data = msgspec.json.decode(resp.text)
+        if data.get("status") != "success":
+            raise RequestFailedError(
+                f"imgauth failed for {fetcher.site_string}: {data.get('error', 'unknown')}"
+            )
+        auth = data["response"]
+    except (msgspec.DecodeError, ValueError, KeyError) as e:
+        raise RequestFailedError(f"imgauth response from {fetcher.site_string} could not be parsed: {e}") from e
+    parsed = urlparse(url)
+    # Merge imgauth params with any existing query params, preserving the original URL structure.
+    existing = parse_qs(parsed.query)
+    existing.update({"h": [auth["h"]], "e": [str(auth["e"])], "u": [str(auth["u"])]})
+    new_query = "&".join(f"{k}={v[0]}" for k, v in existing.items())
+    return parsed._replace(query=new_query).geturl()
 
 
 async def _upload_image(content: bytes, suffix: str, shown: str, target: "BaseGazelleApi", host: str) -> str:
