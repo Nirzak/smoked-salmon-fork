@@ -217,7 +217,7 @@ class Release:
     response: dict[str, Any]  # SOURCE's torrent answer
     path: Path  # The album folder, resolved
     data: dict[str, Any]  # The upload form of the source format, before its images are rehosted
-    rehost: list[tuple[str, str]] = field(default_factory=list)  # (field, URL) of each SOURCE image to rehost
+    rehost: list[tuple[str, str, str]] = field(default_factory=list)  # (field, URL, fetcher) to rehost
     tasks: list[dict[str, Any]] = field(default_factory=list)  # The conversions asked for, as `up` makes them
     track_data: dict[str, Any] = field(default_factory=dict)  # Read from the files, when needed
     notes: list[str] = field(default_factory=list)  # What the plan says about it
@@ -1002,19 +1002,22 @@ def _images(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _images_to_rehost(
     data: dict[str, Any], source: "BaseGazelleApi", target: "BaseGazelleApi"
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     """Decide what happens to each tracker image.
 
     An image on a host that is no tracker's stays as it is. One on a tracker's host that TARGET shows goes as
-    its bare URL (rewritten in data here). One on SOURCE's own site that TARGET cannot show is rehosted.
+    its bare URL (rewritten in data here). One on a tracker's site that TARGET cannot show is rehosted: fetched
+    through that tracker's client (SOURCE's, or the image host's tracker when it is configured) and uploaded to
+    TARGET's configured image host.
 
     Returns:
-        The (field, URL) of each image to rehost, in order.
+        The (field, URL, fetcher_code) of each image to rehost, where fetcher_code is the site code
+        of the tracker whose client should fetch the image.
 
     Raises:
-        CrossUploadRefused: For an image no client can fetch, or too many to rehost.
+        CrossUploadRefused: For an image no configured client can fetch, or too many to rehost.
     """
-    rehost: list[tuple[str, str]] = []
+    rehost: list[tuple[str, str, str]] = []
     for field_name, url in _images(data):
         tracker = _tracker_of(url, (source, target))
         if tracker is None:
@@ -1022,14 +1025,34 @@ def _images_to_rehost(
         if _shows_on(tracker, target.site_code):
             data[field_name] = data[field_name].replace(url, _bare(url))
             continue
-        if tracker != source.site_code or not _same_origin(url, source.base_url):
+        # Find a configured tracker whose client can fetch the image from its own site.
+        fetcher = _fetcher_for(url, tracker, source)
+        if fetcher is None:
             raise CrossUploadRefused(
                 f"it shows an image on {urlparse(url).hostname}, which {target.site_string} cannot show"
+                f" and no configured tracker can fetch"
             )
-        rehost.append((field_name, url))
-    if len({url for _, url in rehost}) > MAX_REHOSTED_IMAGES:
+        rehost.append((field_name, url, fetcher))
+    if len({url for _, url, _ in rehost}) > MAX_REHOSTED_IMAGES:
         raise CrossUploadRefused(f"more than {MAX_REHOSTED_IMAGES} images would need rehosting")
     return rehost
+
+
+def _fetcher_for(url: str, tracker: str, source: "BaseGazelleApi") -> str | None:
+    """The site code of a configured tracker that can fetch the image, or None.
+
+    SOURCE's own site is preferred. Otherwise, the tracker whose host serves the image is used
+    if it is configured and the image is on its origin.
+    """
+    if tracker == source.site_code and _same_origin(url, source.base_url):
+        return source.site_code
+    # The image is on another tracker's host. Use that tracker's client if it is configured.
+    if tracker in salmon.trackers.tracker_list:
+        fetcher_class = salmon.trackers.get_class(tracker)
+        fetcher_instance = fetcher_class()
+        if _same_origin(url, fetcher_instance.base_url):
+            return tracker
+    return None
 
 
 def _same_origin(url: str, base_url: str) -> bool:
@@ -1160,7 +1183,7 @@ def most_requests(release: Release, target: "BaseGazelleApi", group_id: int | No
     if release.lossy_report is not None:
         posts += uploads  # The lossy report of each upload, never sent again
         gets += 2 * uploads  # The pages each redirects to
-    return gets, posts, len({url for _, url in release.rehost})
+    return gets, posts, len({url for _, url, _ in release.rehost})
 
 
 def _searchstrs(data: dict[str, Any]) -> list[str]:
@@ -1191,12 +1214,17 @@ def _print_plan(
         click.echo(f"   uploads: {', '.join(formats)}")
         gets, posts, image_gets = most_requests(release, target, group_id)
         if release.rehost:
-            click.echo(f"   images to rehost: {image_gets}, each fetched once from {source.site_string}")
+            fetcher_names = sorted({code for _, _, code in release.rehost})
+            fetcher_label = ", ".join(fetcher_names)
+            click.echo(f"   images to rehost: {image_gets}, each fetched once from {fetcher_label}")
         for note in release.notes:
             click.echo(f"   {note}")
         # The reads of SOURCE done so far are not counted: only the images still to fetch are.
+        source_image_gets = len({url for _, url, code in release.rehost if code == source.site_code})
         source_gets = (
-            f"{image_gets} image GET to {source.site_string}" if image_gets else f"no more GET to {source.site_string}"
+            f"{source_image_gets} image GET to {source.site_string}"
+            if source_image_gets
+            else f"no more GET to {source.site_string}"
         )
         click.echo(f"   at most {gets} GET and {posts} POST to {target.site_string}, {source_gets}")
     if cfg.upload.torrent_name_normalization not in ("", "none"):
@@ -1290,46 +1318,52 @@ def _edition(release: Release) -> dict[str, Any]:
 
 
 async def _rehost_images(
-    data: dict[str, Any], rehost: list[tuple[str, str]], source: "BaseGazelleApi", target: "BaseGazelleApi"
+    data: dict[str, Any], rehost: list[tuple[str, str, str]], source: "BaseGazelleApi", target: "BaseGazelleApi"
 ) -> None:
-    """Fetch each SOURCE image TARGET cannot show through SOURCE's client, upload it to TARGET's host, swap the URL.
+    """Fetch each image TARGET cannot show through the appropriate tracker's client, upload it to TARGET's host.
 
     Each URL is fetched once, even when it is both the cover and a description image going to two hosts.
+    The fetcher may be SOURCE or another configured tracker whose site hosts the image.
 
     Raises:
         CrossUploadRefused: If a fetch or an upload fails, or a host gives no usable URL.
     """
     images: dict[str, tuple[bytes, str]] = {}
     new_urls: dict[tuple[str, str], str] = {}
-    for field_name, url in rehost:
+    fetchers: dict[str, BaseGazelleApi] = {source.site_code: source}
+    for field_name, url, fetcher_code in rehost:
         host = (
             cfg.image.host_for(target.site_code, "cover_uploader")
             if field_name == "image"
             else image_host_for_tracker(target.site_code)
         )
         if url not in images:
-            images[url] = await _fetch_source_image(url, source)
+            if fetcher_code not in fetchers:
+                fetchers[fetcher_code] = salmon.trackers.get_class(fetcher_code)()
+            images[url] = await _fetch_image(url, fetchers[fetcher_code])
         key = (host, url)
         if key not in new_urls:
             new_urls[key] = await _upload_image(*images[url], _bare(url), target, host)
         data[field_name] = data[field_name].replace(url, new_urls[key])
 
 
-async def _fetch_source_image(url: str, source: "BaseGazelleApi") -> tuple[bytes, str]:
-    """Fetch an image from SOURCE's own site through SOURCE's client: its content and its file suffix.
+async def _fetch_image(url: str, fetcher: "BaseGazelleApi") -> tuple[bytes, str]:
+    """Fetch an image from a tracker's own site through that tracker's client: its content and its file suffix.
+
+    The fetcher's credentials only ever go to its own site.
 
     Raises:
-        CrossUploadRefused: If it is not on SOURCE's site, cannot be fetched, or is not an image.
+        CrossUploadRefused: If it is not on the fetcher's site, cannot be fetched, or is not an image.
     """
-    shown = _bare(url)  # The URL may carry SOURCE's per-viewer signature: never printed.
-    if not _same_origin(url, source.base_url):
-        raise CrossUploadRefused(f"{shown} is not on {source.site_string}'s own site")
-    click.secho(f"Fetching {shown} from {source.site_string}...", fg="yellow")
+    shown = _bare(url)  # The URL may carry the tracker's per-viewer signature: never printed.
+    if not _same_origin(url, fetcher.base_url):
+        raise CrossUploadRefused(f"{shown} is not on {fetcher.site_string}'s own site")
+    click.secho(f"Fetching {shown} from {fetcher.site_string}...", fg="yellow")
     try:
-        # Through SOURCE's client: its rate limit, retries and redirect rules, and its credentials only ever
+        # Through the fetcher's client: its rate limit, retries and redirect rules, and its credentials only ever
         # go to its own site.
-        response = await source._request(
-            "GET", url, timeout_secs=30, prefer_api_key=not source.has_session_cookie, needs_authkey=False, binary=True
+        response = await fetcher._request(
+            "GET", url, timeout_secs=30, prefer_api_key=not fetcher.has_session_cookie, needs_authkey=False, binary=True
         )
     except RequestError as error:
         raise CrossUploadRefused(f"could not fetch {shown} ({type(error).__name__})") from None
